@@ -1,0 +1,26 @@
+services:
+  voice-analysis-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: voice-analysis-agent:local
+    ports:
+      - "8080:8080"
+    environment:
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID}
+      GCP_REGION: ${GCP_REGION:-us-central1}
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME}
+      VERTEX_MODEL_NAME: ${VERTEX_MODEL_NAME:-gemini-2.5-pro}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      APP_ENV: development
+      # Local dev only: mount a service-account key file OUTSIDE source
+      # control and point to it here. In production, do NOT set this -
+      # use an attached runtime service account instead.
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/sa-key.json
+    volumes:
+      - ${LOCAL_SA_KEY_PATH:-./secrets/sa-key.json}:/secrets/sa-key.json:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
