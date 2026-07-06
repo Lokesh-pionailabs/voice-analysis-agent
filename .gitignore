@@ -11,3 +11,16 @@ htmlcov/
 .DS_Store
 *.egg-info/
 voice-ai.json
+
+# Data and logs
+transcripts/
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# Build and dist
+build/
+dist/
+*.egg
