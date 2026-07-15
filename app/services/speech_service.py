@@ -67,9 +67,17 @@ class SpeechService:
             f"/recognizers/{settings.speech_recognizer_id}"
         )
 
-    def _build_recognition_config(self, *, language_codes: list[str] | None = None) -> RecognitionConfig:
+    def _build_recognition_config(
+        self,
+        *,
+        language_codes: list[str] | None = None,
+        inline_content: bool = False,
+    ) -> RecognitionConfig:
+        # Speaker diarization is NOT supported with inline Recognize requests
+        # for any current model (long, chirp_2, etc.) — only with
+        # BatchRecognize (GCS). Skip it for inline content to avoid 400 errors.
         diarization = None
-        if self._settings.enable_speaker_diarization:
+        if self._settings.enable_speaker_diarization and not inline_content:
             diarization = SpeakerDiarizationConfig(
                 min_speaker_count=self._settings.diarization_min_speakers,
                 max_speaker_count=self._settings.diarization_max_speakers,
@@ -119,13 +127,19 @@ class SpeechService:
         *,
         language_codes: list[str] | None = None,
         max_retries: int = 3,
+        format: str | None = None,
     ) -> RawTranscriptionResult:
         """Transcribe raw audio bytes without staging in GCS, automatically chunking long audio.
+
+        Uses temp files for decoding (critical for formats like weba/webm that
+        require seeking) and splits long audio into overlapping chunks to avoid
+        cutting words at boundaries.
 
         Args:
             content: Raw audio bytes.
             language_codes: Optional override of the configured language codes.
             max_retries: Number of retry attempts on transient failures.
+            format: Audio format hint (e.g. 'weba', 'wav', 'mp3').
 
         Returns:
             The raw transcription result.
@@ -133,65 +147,145 @@ class SpeechService:
         Raises:
             SpeechServiceError: If transcription fails after all retries.
         """
-        import io
         import asyncio
+        import io
+        import os
+        import tempfile
+
         from pydub import AudioSegment
 
-        audio = AudioSegment.from_file(io.BytesIO(content))
-        duration_seconds = len(audio) / 1000.0
+        # --- Decode audio in a threadpool (pydub/ffmpeg is blocking I/O) ---
+        def _load_audio() -> AudioSegment:
+            # Always write to a temp file first: weba/webm containers require
+            # seeking which BytesIO can't provide reliably to ffmpeg.
+            decode_ext = format or "wav"
+            if decode_ext == "weba":
+                decode_ext = "webm"
 
+            with tempfile.NamedTemporaryFile(suffix=f".{decode_ext}", delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+
+            try:
+                audio = AudioSegment.from_file(tmp_path, format=decode_ext)
+                # Normalize to 16 kHz 16-bit mono — optimal for Google STT
+                audio = audio.set_frame_rate(16000).set_sample_width(2).set_channels(1)
+                return audio
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+        audio = await asyncio.to_thread(_load_audio)
+        duration_seconds = len(audio) / 1000.0
+        logger.info("Audio decoded: %.1f seconds, format=%s", duration_seconds, format)
+
+        # --- Short audio: send in a single request ---
         if duration_seconds <= 55:
-            return await self._transcribe_recognize_request(
+            buf = io.BytesIO()
+            audio.export(buf, format="wav")
+            wav_bytes = buf.getvalue()
+            result = await self._transcribe_recognize_request(
                 RecognizeRequest(
-                    recognizer=self._recognizer_path, 
-                    config=self._build_recognition_config(language_codes=language_codes),
-                    content=content
+                    recognizer=self._recognizer_path,
+                    config=self._build_recognition_config(language_codes=language_codes, inline_content=True),
+                    content=wav_bytes,
                 ),
                 retry_target="inline audio",
             )
+            result.duration_seconds = duration_seconds
+            return result
 
-        chunk_length_ms = 50 * 1000
-        chunks = [audio[i:i + chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
-        
-        async def process_chunk(index: int, chunk: AudioSegment) -> tuple[int, RawTranscriptionResult]:
-            buf = io.BytesIO()
-            chunk.export(buf, format="wav")
-            chunk_bytes = buf.getvalue()
+        # --- Long audio: split into overlapping chunks ---
+        chunk_length_ms = 58 * 1000   # 58 s per chunk (under the 60 s inline limit)
+        overlap_ms = 3 * 1000          # 3 s overlap to avoid cutting words
+
+        step_ms = chunk_length_ms - overlap_ms  # effective advance per chunk
+
+        chunks: list[tuple[int, AudioSegment, float]] = []  # (index, segment, offset_seconds)
+        pos = 0
+        idx = 0
+        while pos < len(audio):
+            end = min(pos + chunk_length_ms, len(audio))
+            chunks.append((idx, audio[pos:end], pos / 1000.0))
+            pos += step_ms
+            idx += 1
+            # Avoid a tiny trailing chunk (< 2 s) that often produces garbage
+            if len(audio) - pos < 2000:
+                # Extend the last chunk to cover the remainder
+                last_idx, _, last_offset = chunks[-1]
+                chunks[-1] = (last_idx, audio[int(last_offset * 1000):], last_offset)
+                break
+
+        logger.info(
+            "Splitting %.1f s audio into %d overlapping chunks (chunk=%.0f s, overlap=%.0f s)",
+            duration_seconds, len(chunks), chunk_length_ms / 1000, overlap_ms / 1000,
+        )
+
+        async def _transcribe_chunk(index: int, chunk: AudioSegment, offset_s: float) -> tuple[int, float, RawTranscriptionResult]:
+            def _export():
+                buf = io.BytesIO()
+                chunk.export(buf, format="wav")
+                return buf.getvalue()
             
+            chunk_bytes = await asyncio.to_thread(_export)
+
             res = await self._transcribe_recognize_request(
                 RecognizeRequest(
-                    recognizer=self._recognizer_path, 
-                    config=self._build_recognition_config(language_codes=language_codes),
-                    content=chunk_bytes
+                    recognizer=self._recognizer_path,
+                    config=self._build_recognition_config(language_codes=language_codes, inline_content=True),
+                    content=chunk_bytes,
                 ),
                 retry_target=f"chunk {index}",
             )
-            return index, res
+            return index, offset_s, res
 
-        semaphore = asyncio.Semaphore(5)
-        async def sem_process(index: int, chunk: AudioSegment) -> tuple[int, RawTranscriptionResult]:
+        # Use a semaphore to limit concurrency (10 at a time instead of 2)
+        # to dramatically speed up transcription of long audio files
+        semaphore = asyncio.Semaphore(10)
+
+        async def _sem_transcribe(index: int, chunk: AudioSegment, offset_s: float) -> tuple[int, float, RawTranscriptionResult]:
             async with semaphore:
-                return await process_chunk(index, chunk)
-                
-        tasks = [sem_process(i, c) for i, c in enumerate(chunks)]
+                return await _transcribe_chunk(index, chunk, offset_s)
+
+        tasks = [_sem_transcribe(i, seg, off) for i, seg, off in chunks]
         results = await asyncio.gather(*tasks)
-        results.sort(key=lambda x: x[0])
-        
-        full_text_parts = []
-        all_words = []
-        for index, res in results:
-            offset_seconds = index * 50.0
-            if res.full_text.strip():
-                full_text_parts.append(res.full_text)
+        results_sorted = sorted(results, key=lambda x: x[0])
+
+        # --- Merge chunk results, de-duplicating the overlap region ---
+        full_text_parts: list[str] = []
+        all_words: list[TranscriptWord] = []
+        global_end_seconds = 0.0  # tracks the latest word end across all merged chunks
+
+        for index, offset_s, res in results_sorted:
+            # Shift word timestamps by the chunk's offset in the full audio
             for w in res.words:
-                w.start_seconds += offset_seconds
-                w.end_seconds += offset_seconds
-                all_words.append(w)
-                
+                w.start_seconds += offset_s
+                w.end_seconds += offset_s
+
+            if index == 0:
+                # First chunk: take everything
+                if res.full_text.strip():
+                    full_text_parts.append(res.full_text)
+                all_words.extend(res.words)
+                if res.words:
+                    global_end_seconds = res.words[-1].end_seconds
+            else:
+                # Subsequent chunks: skip words that fall within the overlap
+                # region (i.e., words whose start_seconds < global_end_seconds)
+                # to avoid duplicating words at the boundary.
+                new_words = [w for w in res.words if w.start_seconds >= global_end_seconds - 0.15]
+                new_text_parts = [w.word for w in new_words]
+
+                if new_text_parts:
+                    full_text_parts.append(" ".join(new_text_parts))
+                all_words.extend(new_words)
+                if new_words:
+                    global_end_seconds = max(global_end_seconds, new_words[-1].end_seconds)
+
         return RawTranscriptionResult(
             full_text=" ".join(full_text_parts),
             words=all_words,
-            duration_seconds=duration_seconds
+            duration_seconds=duration_seconds,
         )
 
     async def _transcribe_recognize_request(

@@ -27,6 +27,10 @@ the transcript - do not assume information that was not said.
   range, and justify the overall score in `overall_explanation`.
 - `overall_grade` should be a letter grade consistent with `overall_score` \
   (A: 90-100, B: 80-89, C: 70-79, D: 60-69, F: <60).
+- CRITICAL: Even if the transcript is extremely short, disjointed, poor quality, or \
+  mostly incoherent, you MUST NOT return 0s for the scores. Do your absolute best \
+  to extrapolate and provide baseline estimated scores (e.g., 50-70) based on whatever \
+  limited text is available. Never refuse to score.
 
 ## Dimensions to evaluate
 1. Communication skills: clarity, fluency, confidence, professionalism.
