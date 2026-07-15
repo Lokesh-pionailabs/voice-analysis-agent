@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status, BackgroundTasks
 
 from app.api.dependencies import (
     AnalysisServiceDep,
@@ -15,7 +15,7 @@ from app.api.dependencies import (
     TranscriptServiceDep,
     verify_api_key,
 )
-from app.models.response import AnalyzeAudioResponse
+from app.models.response import AnalyzeAudioResponse, TranscriptSegment
 from app.services.analysis_service import AnalysisServiceError
 from app.services.speech_service import SpeechServiceError
 from app.services.storage_service import StorageServiceError
@@ -31,6 +31,7 @@ _CONTENT_TYPES = {
     "wav": "audio/wav",
     "m4a": "audio/mp4",
     "flac": "audio/flac",
+    "weba": "audio/webm",
 }
 
 
@@ -48,7 +49,8 @@ async def analyze_audio(
     transcript_service: TranscriptServiceDep,
     analysis_service: AnalysisServiceDep,
     scoring_service: ScoringServiceDep,
-    audio_file: UploadFile = File(..., description="Audio file: mp3, wav, m4a, or flac"),
+    background_tasks: BackgroundTasks,
+    audio_file: UploadFile = File(..., description="Audio file: mp3, wav, m4a, flac, or weba"),
     language_code: str | None = Form(default=None),
 ) -> AnalyzeAudioResponse:
     """Run the full pipeline: upload -> transcribe -> clean -> analyze -> score.
@@ -69,39 +71,34 @@ async def analyze_audio(
     _validate_size(settings, content)
 
     extension = get_file_extension(audio_file.filename or "")
+
     content_type = _CONTENT_TYPES.get(extension, audio_file.content_type or "application/octet-stream")
 
-    gcs_uri: str | None = None
-    raw_result = None
+    import asyncio
 
-    if settings.gcs_bucket_name:
-        # Step 1 & 2: stage audio in GCS.
-        date_prefix = datetime.now(timezone.utc).strftime("%Y/%m/%d")
-        destination_path = f"uploads/{date_prefix}/{request_id}.{extension}"
-        try:
-            gcs_uri = await storage_service.upload_audio(
-                destination_path=destination_path, content=content, content_type=content_type
-            )
-        except StorageServiceError as exc:
-            logger.error("[%s] Storage upload failed: %s", request_id, exc)
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Failed to store audio file.") from exc
+    async def _do_upload() -> str | None:
+        if settings.gcs_bucket_name:
+            date_prefix = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+            destination_path = f"uploads/{date_prefix}/{request_id}.{extension}"
+            try:
+                return await storage_service.upload_audio(
+                    destination_path=destination_path, content=content, content_type=content_type
+                )
+            except StorageServiceError as exc:
+                logger.error("[%s] Storage upload failed: %s", request_id, exc)
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Failed to store audio file.") from exc
+        return None
 
-        # Step 3: transcribe.
+    async def _do_transcribe():
         try:
-            raw_result = await speech_service.transcribe_gcs_uri(
-                gcs_uri, language_codes=[language_code] if language_code else None
+            return await speech_service.transcribe_audio_content(
+                content, language_codes=[language_code] if language_code else None, format=extension
             )
         except SpeechServiceError as exc:
             logger.error("[%s] Transcription failed: %s", request_id, exc)
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Speech-to-text transcription failed.") from exc
-    else:
-        try:
-            raw_result = await speech_service.transcribe_audio_content(
-                content, language_codes=[language_code] if language_code else None
-            )
-        except SpeechServiceError as exc:
-            logger.error("[%s] Transcription failed: %s", request_id, exc)
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Speech-to-text transcription failed.") from exc
+
+    gcs_uri, raw_result = await asyncio.gather(_do_upload(), _do_transcribe())
 
     if not raw_result.full_text.strip():
         raise HTTPException(
@@ -122,7 +119,7 @@ async def analyze_audio(
 
     analysis = scoring_service.normalize(analysis)
 
-    _save_transcript_locally(settings.local_transcript_path, request_id, llm_transcript)
+    background_tasks.add_task(_save_transcript_locally, request_id, segments)
 
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     logger.info("[%s] Completed analysis in %d ms", request_id, elapsed_ms)
@@ -139,11 +136,56 @@ async def analyze_audio(
     )
 
 
-def _save_transcript_locally(base_path: str, request_id: str, transcript: str) -> None:
-    path = Path(base_path)
+def _save_transcript_locally(request_id: str, segments: list[TranscriptSegment]) -> None:
+    import json
+    from datetime import timedelta
+    
+    path = Path("transcripts")
     path.mkdir(parents=True, exist_ok=True)
-    file_path = path / f"{request_id}.txt"
-    file_path.write_text(transcript, encoding="utf-8")
+    file_path = path / f"{request_id}.json"
+    
+    base_time = datetime.now(timezone.utc)
+    
+    json_data = []
+    for seg in segments:
+        role = "assistant" if seg.speaker == "Speaker 1" else "user" if seg.speaker == "Speaker 2" else "unknown"
+        start_sec = seg.start_seconds or 0.0
+        end_sec = seg.end_seconds or 0.0
+        
+        start_td = timedelta(seconds=start_sec)
+        end_td = timedelta(seconds=end_sec)
+        
+        current_ts = base_time + start_td
+        end_ts = base_time + end_td
+        
+        def format_td(td: timedelta) -> str:
+            total_seconds = int(td.total_seconds())
+            hours, remainder = divmod(total_seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{td.microseconds:06d}"
+        
+        iso_str = current_ts.isoformat()
+        end_iso_str = end_ts.isoformat()
+        
+        epoch_ms = int(current_ts.timestamp() * 1000)
+        end_epoch_ms = int(end_ts.timestamp() * 1000)
+        
+        json_data.append({
+            "role": role,
+            "text": seg.text,
+            "finished": True,
+            "timestamp": iso_str,
+            "tsIso": iso_str,
+            "tsEpochMs": epoch_ms,
+            "startTsIso": iso_str,
+            "startTsEpochMs": epoch_ms,
+            "endTsIso": end_iso_str,
+            "endTsEpochMs": end_epoch_ms,
+            "startTime": format_td(start_td),
+            "endTime": format_td(end_td)
+        })
+        
+    file_path.write_text(json.dumps(json_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _validate_upload(settings: SettingsDep, audio_file: UploadFile) -> None:

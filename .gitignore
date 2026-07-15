@@ -2,7 +2,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-.env
 secrets/
 *.json.key
 .pytest_cache/
@@ -17,10 +16,11 @@ transcripts/
 *.log
 
 # IDEs
-.vscode/
 .idea/
 
 # Build and dist
 build/
 dist/
 *.egg
+config.bat
+node_modules

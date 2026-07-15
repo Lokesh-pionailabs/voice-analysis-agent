@@ -76,7 +76,7 @@ class Settings(BaseSettings):
 
     # --- Upload constraints --------------------------------------------------
     max_audio_size_mb: int = Field(default=200, ge=1)
-    allowed_audio_extensions: List[str] = Field(default_factory=lambda: ["mp3", "wav", "m4a", "flac"])
+    allowed_audio_extensions: List[str] = Field(default_factory=lambda: ["mp3", "wav", "m4a", "flac", "weba"])
 
     # --- App / server ----------------------------------------------------------
     app_env: str = Field(default="production")

@@ -9,6 +9,10 @@ multiple workers disabled in favor of Cloud Run's own container
 concurrency model (see Dockerfile / README for details).
 """
 
+import utils.clients
+import utils.http_session
+import utils.transport
+import utils.session
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, status
